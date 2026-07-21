@@ -1,0 +1,4 @@
+# Install the official IBKR TWS API `ibapi` package separately from the
+# TWS API download (https://interactivebrokers.github.io/) - it is not on PyPI.
+psycopg[binary]
+python-dotenv
