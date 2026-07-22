@@ -8,10 +8,10 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
-_ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+_ENV_PATH = Path(__file__).resolve().parents[2] / ".env"#跨目录动态定位项目的配置文件 .env
 
 
-class ConfigError(RuntimeError):
+class ConfigError(RuntimeError):#在main里体现出各自的异常
     """Raised when required configuration is missing or invalid."""
 
 
@@ -56,14 +56,14 @@ class PostgresSettings:
     user: str
     password: str
 
-    def __repr__(self) -> str:
+    def __repr__(self) -> str:#将敏感信息隐藏
         return (
             f"PostgresSettings(host={self.host!r}, port={self.port}, "
             f"database={self.database!r}, user={self.user!r}, password='***')"
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True)#采用Local socket通信
 class IbkrSettings:
     host: str
     port: int

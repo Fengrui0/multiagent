@@ -8,8 +8,9 @@ potentially incomplete current-day bar -> upsert -> print summary.
 from __future__ import annotations
 
 import logging
+import re
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -41,6 +42,8 @@ SOURCE = "IBKR"
 
 _NEW_YORK_TZ = ZoneInfo("America/New_York")
 _REGULAR_SESSION_CLOSE_HOUR = 16  # 4:00 PM America/New_York
+_INCREMENTAL_DURATION_PATTERN = re.compile(r"^(\d+)\s+D$")
+_INCREMENTAL_DURATION_LOOKBACK_BUFFER_DAYS = 5
 
 logger = logging.getLogger(__name__)
 
@@ -58,10 +61,33 @@ def _verify_postgres() -> None:
             cur.execute("SELECT 1")
 
 
-def _choose_duration(latest_date, settings: Settings) -> tuple[str, bool]:
+def _parse_incremental_duration_days(duration: str) -> int:
+    match = _INCREMENTAL_DURATION_PATTERN.match(duration.strip())
+    if match is None:
+        raise ConfigError(
+            "AAPL_INCREMENTAL_DURATION must be in the format '<positive integer> D', "
+            f"got: {duration!r}"
+        )
+    days = int(match.group(1))
+    if days <= 0:
+        raise ConfigError(
+            "AAPL_INCREMENTAL_DURATION must be a positive integer number of days, "
+            f"got: {duration!r}"
+        )
+    return days
+
+
+def _choose_duration(
+    latest_date: date | None, now_ny_date: date, settings: Settings
+) -> tuple[str, bool, int | None]:
     is_initial = latest_date is None
-    duration = settings.aapl.initial_duration if is_initial else settings.aapl.incremental_duration
-    return duration, is_initial
+    if is_initial:
+        return settings.aapl.initial_duration, is_initial, None
+
+    minimum_incremental_days = _parse_incremental_duration_days(settings.aapl.incremental_duration)
+    days_since_latest = (now_ny_date - latest_date).days
+    requested_days = max(minimum_incremental_days, days_since_latest + _INCREMENTAL_DURATION_LOOKBACK_BUFFER_DAYS)
+    return f"{requested_days} D", is_initial, days_since_latest
 
 
 def _is_potentially_incomplete_today_bar(trade_date, now_ny: datetime) -> bool:
@@ -123,7 +149,7 @@ def _print_summary(summary: repo.DailyBarSummary) -> None:
 
 
 def main() -> int:
-    _configure_logging()
+    _configure_logging()# print where the error happen
 
     try:
         settings = get_settings()
@@ -131,23 +157,23 @@ def main() -> int:
         logger.error("Configuration error: %s", exc)
         return 1
 
-    logger.info(
-        "PostgreSQL target: host=%s port=%s db=%s user=%s",
-        settings.postgres.host,
-        settings.postgres.port,
-        settings.postgres.database,
-        settings.postgres.user,
+    logger.info(  # 输出 INFO 级别日志
+        "PostgreSQL target: host=%s port=%s db=%s user=%s",  # 日志格式模板（避免敏感信息泄漏，不打印密码）
+        settings.postgres.host,  # 数据库的主机名/IP
+        settings.postgres.port,  # 数据库服务端口（默认 5432）
+        settings.postgres.database,  # 目标数据库名称
+        settings.postgres.user,  # 连接使用的用户名
     )
 
     try:
-        _verify_postgres()
+        _verify_postgres()# 尝试执行数据库连接验证函数
     except psycopg.OperationalError as exc:
         logger.error("Could not connect to PostgreSQL: %s", exc)
         return 1
     logger.info("PostgreSQL connection OK")
 
     try:
-        if not repo.verify_table_exists():
+        if not repo.verify_table_exists():# Check if the table already exist
             logger.error(
                 "Table %s does not exist. Apply the migration: "
                 "psql -f sql/001_create_market_daily_bar.sql",
@@ -160,27 +186,35 @@ def main() -> int:
     logger.info("Table %s verified", repo.TABLE_NAME)
 
     try:
-        latest_date = repo.get_latest_trade_date(SYMBOL, WHAT_TO_SHOW)
+        latest_date = repo.get_latest_trade_date(SYMBOL, WHAT_TO_SHOW)# find the latest date through symbol and what_to_show
     except psycopg.Error as exc:
         logger.error("Failed to query latest trade date: %s", exc)
         return 1
 
-    duration, is_initial = _choose_duration(latest_date, settings)
+    now_ny_date = datetime.now(_NEW_YORK_TZ).date()
+
+    try:
+        duration, is_initial, days_since_latest = _choose_duration(latest_date, now_ny_date, settings)
+    except ConfigError as exc:
+        logger.error("Configuration error: %s", exc)
+        return 1
+
     logger.info(
-        "Mode=%s latest_stored_date=%s request_duration=%s",
+        "Mode=%s latest_stored_date=%s days_since_latest=%s request_duration=%s",
         "initial" if is_initial else "incremental",
         latest_date,
+        days_since_latest if days_since_latest is not None else "N/A",
         duration,
     )
 
-    client = IbkrHistoricalDataClient(
+    client = IbkrHistoricalDataClient(# 实例化自定义的 IBKR 历史数据客户端类
         host=settings.ibkr.host,
         port=settings.ibkr.port,
         client_id=settings.ibkr.client_id,
     )
 
-    bars: list[HistoricalBar] = []
-    con_id: int | None = None
+    bars: list[HistoricalBar] = []#used to store K线
+    con_id: int | None = None#contract ID
 
     try:
         client.connect_and_start(timeout_seconds=settings.ibkr.connection_timeout_seconds)
@@ -195,16 +229,16 @@ def main() -> int:
 
         details = client.resolve_contract(
             contract,
-            req_id=client.next_request_id(),
+            req_id=client.next_request_id(),#生成一个唯一的请求ID
             timeout_seconds=settings.ibkr.connection_timeout_seconds,
         )
-        con_id = details.contract.conId
+        con_id = details.contract.conId#从 IBKR 返回的完整合约详情中提取出唯一标识符 conId
         logger.info("Resolved AAPL contract: con_id=%s", con_id)
 
-        bars = client.request_daily_bars(
+        bars = client.request_daily_bars(#最终数据列表
             contract,
             req_id=client.next_request_id(),
-            duration=duration,
+            duration=duration,#请求时间跨度
             timeout_seconds=settings.ibkr.historical_timeout_seconds,
         )
     except (IbkrConnectionError, IbkrTimeoutError, IbkrRequestError) as exc:
@@ -219,7 +253,7 @@ def main() -> int:
         logger.error("No historical bars were returned for %s", SYMBOL)
         return 1
 
-    now_ny = datetime.now(_NEW_YORK_TZ)
+    now_ny = datetime.now(_NEW_YORK_TZ)#过滤掉当天未收盘，数据还不完整的日K线
     complete_bars = []
     excluded_count = 0
     for bar in bars:
@@ -241,7 +275,7 @@ def main() -> int:
     )
 
     try:
-        processed = repo.upsert_daily_bars(valid_rows)
+        processed = repo.upsert_daily_bars(valid_rows)#将清洗/校验后的 K 线数据安全地写入 PostgreSQL 数据库，并进行异常捕捉与日志记录。
     except psycopg.Error as exc:
         logger.error("Database upsert failed: %s", exc)
         return 1
